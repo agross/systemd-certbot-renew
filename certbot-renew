@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+
+set -o pipefail
+
+function renew-certificates()
+{
+  # certbot does not set its exit status based on the --post-hook exit status.
+  # It does, however, print hook exit codes to stderr. Catch these and check
+  # for any to determine our exit code.
+  local log=/var/log/letsencrypt/renew.log
+
+  local self="$(printf '%q' "$(readlink --canonicalize-existing "$0")")"
+  local args=($self -k "$@")
+  # The --post-hook is only called when certificates have been renewed.
+  local certbot=(certbot renew --non-interactive
+                               --text
+                               --agree-tos
+                               --post-hook
+                               "${args[*]}")
+
+  if "${certbot[@]}" 2>&1 | tee "$log"; then
+    if ! grep --quiet 'Hook command .* returned error code' "$log"; then
+      # No hook errors were logged.
+      printf 'Certbot automatic renewal successful\n'
+      return 0
+    fi
+  fi
+
+  >&2 printf 'Certbot automatic renewal failed\n'
+  return 1
+}
+
+# From here on, always log to stderr to have certbot print it.
+
+function renew-cockpit-certificate()
+{
+  local domain="$1"
+
+  [[ -z "$domain" ]] && return
+
+  >&2 printf "Creating new cockpit certificate from Let's Encrypt certificate for domain %s\n" "$domain"
+
+  local fullchain="/etc/letsencrypt/live/$domain/fullchain.pem"
+  local privkey="/etc/letsencrypt/live/$domain/privkey.pem"
+
+  [[ -f "$fullchain" && -f "$privkey" ]] || {
+    >&2 printf "Let's Encrypt certificate not found at %s, %s\n" "$fullchain" "$privkey"
+    return 1
+  }
+
+  local cockpit='/etc/cockpit/ws-certs.d/letsencrypt.cert'
+  cat "$fullchain" "$privkey" > "$cockpit" || {
+    >&2 printf "Failed to create cockpit certificate at %s\n" "$cockpit"
+    return 1
+  }
+
+  local unit=cockpit.service
+  systemctl is-active "$unit" > /dev/null 2>&1 && {
+    >&2 printf 'Restarting %s\n' "$unit"
+    systemctl restart "$unit"
+  } || {
+    >&2 printf 'Unit %s is not active\n' "$unit"
+    return 0
+  }
+}
+
+function webserver-reload()
+{
+  local unit="$1"
+
+  [[ -z "$unit" ]] && {
+    >&2 printf 'Reloading web server omitted\n'
+    return 0
+  }
+
+  systemctl is-active $unit > /dev/null 2>&1 && {
+    >&2 printf 'Reloading web server: %s\n' "$unit"
+    systemctl reload "$unit"
+  } || {
+    >&2 printf 'Unit %s is not active\n' "$unit"
+    return 1
+  }
+}
+
+function etckeeper-commit()
+{
+  hash git 2> /dev/null || {
+    >&2 printf 'git is not installed\n'
+    return 0
+  }
+
+  # Pretend current working directory.
+  local dir="${1?Need git work tree to check}"
+  local git=(git -C "$(printf '%q' "$dir")")
+
+  "${git[@]}" rev-parse --is-inside-work-tree > /dev/null 2>&1 || {
+    >&2 printf 'Not a git work tree: %s\n' "$dir"
+    return 0
+  }
+
+  local untracked="$(${git[@]} ls-files --others --exclude-standard . 2> /dev/null | wc --lines)"
+  "${git[@]}" diff --diff-filter=MARCDTXB --quiet . 2> /dev/null
+  local unstaged=$?
+
+  if [[ "$untracked" == 0 && "$unstaged" == 0 ]]; then
+    >&2 printf 'No changed files in %s\n' "$dir"
+    return 0
+  fi
+
+  >&2 printf 'Committing %d file(s) in %s\n' "$(($untracked + $unstaged))" "$dir"
+  "${git[@]}" add . || return 1
+  "${git[@]}" -c user.name=Certbot \
+              -c user.email=certbot@localhost \
+              commit \
+              --message "Certbot automatic renewal: $dir" || return 1
+}
+
+function show-help()
+{
+  cat << EOF
+Usage: ${0##*/} [-d DOMAIN] [-w WEBSERVER] [-k]
+
+Renew Let's Encrypt certificates and optionally update cockpit certificate and restart web server.
+
+  -d DOMAIN     domain name of the Let's Encrypt certificate for cockpit
+  -w WEBSERVER  name of the web server systemd unit to be restarted
+  -k            run certbot post-update actions (committing, cockpit, web server)
+EOF
+}
+
+function error()
+{
+  >&2 printf 'Error: %s\n\n' "$1"
+  show-help >&2
+}
+
+function parse-argv()
+{
+  domain=
+  webserver=
+  call_hook=
+
+  while getopts ":hkd:w:" opt; do
+    case "$opt" in
+      h)
+        show-help
+        exit 0
+        ;;
+      d)
+        domain="$OPTARG"
+        ;;
+      w)
+        webserver="$OPTARG"
+        ;;
+      k)
+        call_hook=true
+        ;;
+      :)
+        error "Option -$OPTARG requires an argument."
+        return 1
+        ;;
+      '?')
+        error "Invalid option: -$OPTARG"
+        return 1
+        ;;
+    esac
+  done
+}
+
+parse-argv "$@" || exit 1
+
+if [[ -z "$call_hook" ]]; then
+  renew-certificates "$@" || exit 2
+else
+  etckeeper-commit '/etc/letsencrypt/' || exit 3
+
+  renew-cockpit-certificate "$domain" && \
+    etckeeper-commit '/etc/cockpit/ws-certs.d/' || \
+    exit 4
+
+  webserver-reload "$webserver" || exit 5
+fi

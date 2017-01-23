@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+
+set -e
+
+script_path="$(dirname "$(readlink --canonicalize-existing "$0")")"
+
+for unit in certbot.service certbot.timer; do
+  file="$script_path/$unit"
+
+  printf "Linking %s\n" "$file"
+  systemctl link --force "$file"
+
+  if [[ "$unit" == *.timer ]]; then
+    printf "Enabling %s\n" "$file"
+    systemctl enable "$file"
+  fi
+done
+
+ln --symbolic --force "$script_path/certbot-renew" \
+                      /etc/systemd/system/certbot-renew

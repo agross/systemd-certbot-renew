@@ -1,0 +1,9 @@
+[Unit]
+Description=Let's Encrypt automatic renewal
+
+[Service]
+PrivateTmp=true
+Environment='WEBSERVER=-w nginx.service'
+# Debug environment variables.
+ExecStartPre=-/bin/env
+ExecStart=/etc/systemd/system/certbot-renew $COCKPIT_DOMAIN $WEBSERVER
