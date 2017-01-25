@@ -112,7 +112,8 @@ function etckeeper-commit()
   "${git[@]}" -c user.name=Certbot \
               -c user.email=certbot@localhost \
               commit \
-              --message "Certbot automatic renewal: $dir" || return 1
+              --message "Certbot automatic renewal: $dir" \
+              --only -- . || return 1
 }
 
 function show-help()
